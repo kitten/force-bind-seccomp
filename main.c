@@ -64,8 +64,16 @@
 #include <sys/types.h>
 #include <sys/ptrace.h>
 #include <sys/prctl.h>
+#if defined(__x86_64__)
 #include <sys/reg.h>
 #include <sys/user.h>
+#elif defined(__aarch64__)
+#include <sys/user.h>
+#include <sys/uio.h>
+#include <asm/ptrace.h>
+#include <asm/unistd.h>
+#include <elf.h> /* For NT_PRSTATUS */
+#endif
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -87,12 +95,29 @@
 #include <netdb.h>
 #include "scm_functions.h"
 
-#ifdef __x86_64__
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
+
+#if defined(__x86_64__)
 #define SC_NUMBER  (8 * ORIG_RAX)
 #define SC_RETCODE (8 * RAX)
+#elif defined(__aarch64__)
+  /* On aarch64, the system call number is stored in x8 and the return value is in x0.
+     Each register is 8 bytes; thus the offset for x8 is 8*8 and for x0 is 8*0. */
+#define SC_NUMBER  (8 * 8)
+#define SC_RETCODE (8 * 0)
 #else
 #define SC_NUMBER  (4 * ORIG_EAX)
 #define SC_RETCODE (4 * EAX)
+#endif
+
+#if defined(__x86_64__)
+#define ORIG_SYSCALL(regs) ((regs).orig_rax)
+#elif defined(__aarch64__)
+  /* For aarch64, the system call number is in regs[8] and return value in regs[0]
+     where regs is an array in struct user_pt_regs. */
+#define ORIG_SYSCALL(regs) ((regs).regs[8])
 #endif
 
 #include "ip_funcs.h"
@@ -127,7 +152,6 @@ struct mapping {
 struct cmdLineOpts {
     bool require_ptrace;
     bool prevent_listen;
-    bool debug;
     bool quiet;
     bool verbose;
     struct mapping *map;
@@ -283,11 +307,7 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
         return targetPid;
 
     /* Child falls through to here */
-
-    if(opts->debug) printf("Target process: PID = %ld\n", (long) getpid());
-
     /* Install a handler for the SIGINT signal */
-
     sa.sa_handler = handler;
     sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
@@ -342,8 +362,7 @@ static void
 checkNotificationIdIsValid(int notifyFd, __u64 id, char *tag, struct cmdLineOpts *opts)
 {
     if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == -1) {
-        if(opts->debug) fprintf(stderr, "Tracer: notification ID check (%s): "
-                "target has died!!!!!!!!!!!\n", tag);
+        fprintf(stderr, "Tracer: notification ID check (%s): target has died\n", tag);
     }
 }
 
@@ -385,10 +404,8 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
       bzero(req, sizes.seccomp_notif);
       bzero(resp, sizes.seccomp_notif_resp);
 
-      if(opts->debug) printf("Tracer: wait for user notification\n");
       if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_RECV, req) == -1)
           errExit("Tracer: ioctlSECCOMP_IOCTL_NOTIF_RECV");
-      if(opts->debug) printf("Tracer: received notification syscall=%d\n", req->data.nr);
 
       switch(req->data.nr) {
           default:
@@ -415,17 +432,11 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               if(opts->prevent_listen && rfd) {
                   // Ignore syscall
                   resp->flags = 0;
-                  if(opts->verbose) printf("force-bind: ignore listen(%d, %d)\n", req->data.args[0], req->data.args[1]);
-              } else {
-                  if(opts->debug) printf("Tracer: interepted but do not prevent listen(%d, %d)\n", req->data.args[0], req->data.args[1]);
+                  if(opts->verbose) printf("force-bind: ignore listen(%lld, %lld)\n", req->data.args[0], req->data.args[1]);
               }
               break;
           }
           case __NR_bind: {
-
-              if(opts->debug) printf("Tracer: got notification for PID %d; ID is %llx\n",
-                  req->pid, req->id);
-
               /* Access the memory of the target process in order to discover
                  the syscall arguments */
 
@@ -444,21 +455,11 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                  /proc/PID/mem file descriptor that we opened corresponded to the
                  process for which we received a notification. If that process
                  subsequently terminates, then read() on that file descriptor will
-                 return 0 (EOF). This can be tested by (1) uncommenting the sleep()
-                 call below (and rebuilding the program); (2) running the program
-                 with flags to ensure that the tracer is not killed if the target
-                 dies; and (3) killing the target process during the sleep(). */
-
-              // if(opts->debug) printf("About to sleep in target\n");
-              // sleep(15);
-
-              /* Seek to the location containing the pathname argument (i.e., the
-                 first argument) of the mkdir(2) call and read that pathname */
+                 return 0 (EOF). */
 
               int socketfd = req->data.args[0];
               intptr_t addrptr = req->data.args[1];
               size_t addrlen = req->data.args[2];
-              if(opts->debug) printf("Tracer: bind(%d, 0x%llx, %lld, %lld, %lld, %llx)\n", socketfd, addrptr, addrlen, req->data.args[3], req->data.args[4], req->data.args[5]);
 
               if (lseek(procMem, addrptr, SEEK_SET) == -1)
                 errExit("Tracer: lseek");
@@ -471,22 +472,9 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               if (s == -1)
                 errExit("read");
               else if (s == 0) {
-                if(opts->debug) fprintf(stderr, "Tracer: read returned EOF\n");
+                fprintf(stderr, "Tracer: read returned EOF\n");
                 exit(EXIT_FAILURE);
               }
-
-              char addrstring[PATH_MAX];
-              if(opts->debug) {
-                printf("Tracer: %p = %s\n", (void*) addrptr,
-                    get_ip_str(addr, addrstring, sizeof(addrstring)));
-                for(int i = 0; i < addrlen; ++i) {
-                  if(i == 0) printf("Tracer bind addr: %p = ", addr);
-                  printf(" %02x", ((char*) addr)[i]);
-                  if(i == addrlen - 1) printf("\n");
-                }
-              }
-
-              if(opts->debug) printf("Tracer: bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, sizeof(addrstring)));
 
               /* The response to the notification includes the notification ID */
 
@@ -513,22 +501,6 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                 /* Continue the syscall. ideally we should filter the IP address and
                  * make sure it is allowed, but this is not yet implemented */
 
-                // use ptrace (most secure) https://github.com/briceburg/fdclose/blob/master/src/ptrace_do/libptrace_do.c
-                // (but will that call seccomp recursively ???)
-                // or modify process memory and return with SECCOMP_USER_NOTIF_FLAG_CONTINUE
-
-                /*
-                   snprintf(path, sizeof(path), "/proc/%d/fd/%d", req->pid, socketfd);
-
-                   int sock = open(path, 0);
-                   if (sock == -1)
-                   errExit("Tracer: open(sock)");
-
-                   resp->error = bind(sock, addr, addrlen);
-
-                   if(opts->debug) printf("Tracer: bind() = %d", resp->error);
-                   */
-
                 resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
                 struct sockaddr *replacement = malloc(addrlen);
@@ -551,8 +523,6 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   addfd.newfd_flags = 0;
                   int targetFd = ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
 
-                  if(opts->debug) fprintf(stderr, "Tracer: %d file descriptor sent as %d (= %d)\n", newfd, targetFd, socketfd);
-
                   struct replaced_fds *replace_fd = malloc(sizeof(struct replaced_fds));
                   if (replace_fd == NULL) {
                       fprintf(stderr, "force-bind: malloc failed\n");
@@ -567,6 +537,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   resp->error = (targetFd < 0) ? -errno : 0;
                   resp->val   = targetFd;
                 } else if(matchres == 1) {
+                  char addrstring[PATH_MAX];
                   char repladdrstring[PATH_MAX];
                   if(!opts->quiet) printf("force-bind: replace %s with %s\n",
                       get_ip_str(addr, addrstring, sizeof(addrstring)),
@@ -575,48 +546,12 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   if (lseek(procMem, addrptr, SEEK_SET) == -1)
                     errExit("force-bind: lseek");
 
-                  if(opts->debug) {
-                    for(int i = 0; i < addrlen; ++i) {
-                      if(i == 0) printf("Tracer write addr:");
-                      printf(" %02x", ((char*) replacement)[i]);
-                      if(i == addrlen - 1) printf("\n");
-                    }
-                  }
-
                   ssize_t s = write(procMem, replacement, addrlen);
                   if (s == -1)
                     errExit("read");
                   else if (s != addrlen) {
                     fprintf(stderr, "force-bind: short write\n");
                     exit(EXIT_FAILURE);
-                  }
-
-                  if(opts->debug) {
-
-                    if (lseek(procMem, addrptr, SEEK_SET) == -1)
-                      errExit("Tracer: lseek");
-
-                    free(addr);
-                    addr = malloc(addrlen);
-                    if (resp == NULL)
-                      errExit("Tracer: malloc");
-
-                    ssize_t s = read(procMem, addr, addrlen);
-                    if (s == -1)
-                      errExit("read");
-                    else if (s == 0) {
-                      if(opts->debug) fprintf(stderr, "Tracer: read returned EOF\n");
-                      exit(EXIT_FAILURE);
-                    }
-
-                    printf("Tracer: %p = %s\n", (void*) addrptr,
-                        get_ip_str(addr, addrstring, sizeof(addrstring)));
-
-                    for(int i = 0; i < addrlen; ++i) {
-                      if(i == 0) printf("Tracer bind addr:");
-                      printf(" %02x", ((char*) addr)[i]);
-                      if(i == addrlen - 1) printf("\n");
-                    }
                   }
 
                   free(replacement);
@@ -633,16 +568,14 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
         }
 
         /* Provide a response to the target process */
-
         if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_SEND, resp) == -1) {
           if (errno == ENOENT) {
-            if(opts->debug) printf("Tracer: response failed with ENOENT; perhaps target "
+            fprintf(stderr, "Tracer: response failed with ENOENT; perhaps target "
                 "process's syscall was interrupted by signal?\n");
           } else {
             perror("ioctl-SECCOMP_IOCTL_NOTIF_SEND");
           }
         }
-        if(opts->debug) printf("Tracer: notification sent res=%d, errno=%d flags=%d.\n", resp->val, -resp->error, resp->flags);
     }
 }
 
@@ -666,9 +599,6 @@ tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
         return tracerPid;
 
     /* Child falls through to here */
-
-    if(opts->debug) printf("Tracer: PID = %ld\n", (long) getpid());
-
     /* Receive the notification file descriptor from the target process */
 
     int notifyFd = recvfd(sockPair[1]);
@@ -680,8 +610,6 @@ tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
     /* Handle notifications */
 
     watchForNotifications(notifyFd, opts);
-    
-    if(opts->debug) printf("Tracer: exit\n");
 
     exit(EXIT_SUCCESS);         /* NOTREACHED */
 }
@@ -689,23 +617,11 @@ tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
 static int
 wait_for_ptrace(pid_t target, int *res_status, struct cmdLineOpts *opts){
     int status;
-
     while (1) {
         ptrace(PTRACE_CONT, target, 0, 0);
         waitpid(target, &status, 0);
-        if(opts->debug) printf("Tracer: [waitpid status: 0x%08x]\n", status);
-        /* Is it our filter for the open syscall? */
-        if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP && status >> 8 == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8))) {
-            /* Note that there are *three* reasons why the child might stop
-             * with SIGTRAP:
-             *  1) syscall entry
-             *  2) syscall exit
-             *  3) child calls exec
-             *  <https://stackoverflow.com/a/7522990>
-             */
-            long sc_number = ptrace(PTRACE_PEEKUSER, target, SC_NUMBER, NULL);
-            long sc_retcode = ptrace(PTRACE_PEEKUSER, target, SC_RETCODE, NULL);
-            if(opts->debug) printf("Tracer: SIGTRAP syscall %ld, rc = %ld\n", sc_number, sc_retcode);
+        if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP &&
+            (status >> 8) == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8))) {
             return 0;
         }
         if (WIFEXITED(status)) {
@@ -715,69 +631,84 @@ wait_for_ptrace(pid_t target, int *res_status, struct cmdLineOpts *opts){
     }
 }
 
-static void ptrace_read_bind_args(pid_t target, struct user_regs_struct *regs, int *sockfd, struct sockaddr** addr, socklen_t *addrlen, bool debug) {
-    //*sockfd          = (int)       ptrace(PTRACE_PEEKUSER, target, sizeof(long)*RDI, 0);
-    //intptr_t addrptr = (intptr_t)  ptrace(PTRACE_PEEKUSER, target, sizeof(long)*RSI, 0);
-    //*addrlen         = (socklen_t) ptrace(PTRACE_PEEKUSER, target, sizeof(long)*RDX, 0);
-
-    *sockfd          = (int)       regs->rdi;
-    intptr_t addrptr = (intptr_t)  regs->rsi;
+static void ptrace_read_bind_args(pid_t target,
+#if defined(__x86_64__)
+    struct user_regs_struct *regs,
+#elif defined(__aarch64__)
+    struct user_pt_regs *regs,
+#endif
+    int *sockfd, struct sockaddr **addr, socklen_t *addrlen) {
+#if defined(__x86_64__)
+    *sockfd          = (int) regs->rdi;
+    intptr_t addrptr = (intptr_t) regs->rsi;
     *addrlen         = (socklen_t) regs->rdx;
+#elif defined(__aarch64__)
+    *sockfd          = (int) regs->regs[0];
+    intptr_t addrptr = (intptr_t) regs->regs[1];
+    *addrlen         = (socklen_t) regs->regs[2];
+#endif
 
-    if (debug) {
-        printf("Tracer: intercept bind(%ld, %p, %ld)\n", *sockfd, (void*) addrptr, *addrlen);
-    }
-
-    // reserve extra space in case the addrlen is not a multiple of sizeof(long)
+    /* Reserve extra space in case the addrlen is not a multiple of sizeof(long) */
     char buffer[*addrlen + sizeof(long)];
 
-    // Get the address from the process memory
+    /* Get the address from the process memory */
     for (int j = 0; j < *addrlen; j += sizeof(long)) {
         long word = ptrace(PTRACE_PEEKDATA, target, addrptr + j, NULL);
         memcpy(&buffer[j], &word, sizeof(long));
-        if (debug) {
-            printf("Tracer: read address 0x%p+0x%02x %08x\n", (void*) addrptr, j, word);
-        }
     }
 
-    // prepare the address buffer
+    /* Prepare the address buffer */
     *addr = malloc(*addrlen);
     if (*addr == NULL)
         errExit("Tracer: malloc");
 
-    // Copy the address to the buffer
+    /* Copy the address to the buffer */
     memcpy(*addr, buffer, *addrlen);
 }
 
-static bool ptrace_put_bind_args(pid_t target, struct user_regs_struct *regs, int sockfd, struct sockaddr* addr, socklen_t addrlen, bool debug) {
-    int       t_sockfd  = (int)       regs->rdi;
-    intptr_t  addrptr   = (intptr_t)  regs->rsi;
-    socklen_t t_addrlen = (socklen_t) regs->rdx;
+static bool ptrace_put_bind_args(pid_t target,
+#if defined(__x86_64__)
+    struct user_regs_struct *regs,
+#elif defined(__aarch64__)
+    struct user_pt_regs *regs,
+#endif
+    int sockfd, struct sockaddr* addr, socklen_t addrlen) {
+#if defined(__x86_64__)
+    int       t_sockfd  = regs->rdi;
+    intptr_t  addrptr   = regs->rsi;
+    socklen_t t_addrlen = regs->rdx;
+#elif defined(__aarch64__)
+    int       t_sockfd  = regs->regs[0];
+    intptr_t  addrptr   = regs->regs[1];
+    socklen_t t_addrlen = regs->regs[2];
+#endif
 
     if (t_addrlen < addrlen) {
         return false;
     }
 
+#if defined(__x86_64__)
     regs->rdi = sockfd;
     regs->rdx = addrlen;
+#elif defined(__aarch64__)
+    regs->regs[0] = sockfd;
+    regs->regs[2] = addrlen;
+#endif
 
     const char *buffer = (const char*) addr;
 
-    // Get the address from the process memory
+    /* Write the new address into the target process memory */
     for (int j = 0; j < addrlen; j += sizeof(long)) {
         size_t nextlen = j + sizeof(long);
         long word = 0;
         if (nextlen <= addrlen) {
-            // nominal case, there is enough bytes to read buffer and to write
-            // to target
+            /* nominal case */
             word = *((const long*) &buffer[j]);
         } else if (nextlen > t_addrlen) {
-            // there is not enough room on the target to write a full word
+            /* not enough room on the target to write a full word */
             word = ptrace(PTRACE_PEEKDATA, target, addrptr + j, NULL);
             memcpy(&word, &buffer[j], addrlen - j);
         } else {
-            // there is enough room on the target, but not enough to read
-            // locally
             memcpy(&word, &buffer[j], addrlen - j);
         }
         ptrace(PTRACE_POKEDATA, target, addrptr + j, word);
@@ -785,33 +716,36 @@ static bool ptrace_put_bind_args(pid_t target, struct user_regs_struct *regs, in
     return true;
 }
 
-static int
-process_ptrace(pid_t target, struct cmdLineOpts *opts) {
+static int process_ptrace(pid_t target, struct cmdLineOpts *opts) {
     struct replaced_fds *replaced_fds = NULL;
     int res_status = 0;
     while(1) {
-        /* Wait for open syscall start */
+        /* Wait for syscall interception */
         if (wait_for_ptrace(target, &res_status, opts) != 0) return res_status;
-
-        /* Read registers */
+#if defined(__x86_64__)
         struct user_regs_struct regs;
-        ptrace(PTRACE_GETREGS, target, 0, &regs);
+        if(ptrace(PTRACE_GETREGS, target, 0, &regs) == -1)
+            errExit("PTRACE_GETREGS");
+#elif defined(__aarch64__)
+        struct user_pt_regs regs;
+        struct iovec iov;
+        iov.iov_base = &regs;
+        iov.iov_len = sizeof(regs);
+        if (ptrace(PTRACE_GETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+            errExit("PTRACE_GETREGSET");
+#endif
 
-        switch(regs.orig_rax) {
+        switch(ORIG_SYSCALL(regs)) {
             case __NR_bind: {
                 int socketfd;
                 socklen_t addrlen;
                 struct sockaddr *addr;
 
-                ptrace_read_bind_args(target, &regs, &socketfd, &addr, &addrlen, opts->debug);
-
-                if(opts->debug) {
-                    char addrstring[PATH_MAX];
-                    printf("Tracer: intercept bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, sizeof(addrstring)));
-                }
+                ptrace_read_bind_args(target, &regs, &socketfd, &addr, &addrlen);
 
                 if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
-                    continue;
+                    /* For non-INET/INET6, do nothing */
+                    break;
                 } else {
                     struct sockaddr *replacement = malloc(addrlen);
                     if (replacement == NULL)
@@ -823,26 +757,46 @@ process_ptrace(pid_t target, struct cmdLineOpts *opts) {
                     int matchres = matchAllAddr(opts->map, replacement, &sourcefd, opts);
                     if(matchres < 0) {
                         int errnum = -matchres;
-                        // Return an error, first change syscall number to -1 (invalid)
+#if defined(__x86_64__)
                         regs.orig_rax = -1;
-                        ptrace(PTRACE_SETREGS, target, 0, &regs);
-                        // Run the syscall (will do nothing)
+                        if(ptrace(PTRACE_SETREGS, target, 0, &regs) == -1)
+                            errExit("PTRACE_SETREGS");
+#elif defined(__aarch64__)
+                        regs.regs[8] = -1;
+                        iov.iov_base = &regs;
+                        iov.iov_len = sizeof(regs);
+                        if (ptrace(PTRACE_SETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+                            errExit("PTRACE_SETREGSET");
+#endif
                         ptrace(PTRACE_SYSCALL, target, 0, 0);
                         waitpid(target, 0, 0);
-                        // Return the error
+#if defined(__x86_64__)
                         regs.rax = -errnum;
-                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                        if(ptrace(PTRACE_SETREGS, target, 0, &regs) == -1)
+                            errExit("PTRACE_SETREGS");
+#elif defined(__aarch64__)
+                        regs.regs[0] = -errnum;
+                        iov.iov_base = &regs;
+                        iov.iov_len = sizeof(regs);
+                        if (ptrace(PTRACE_SETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+                            errExit("PTRACE_SETREGSET");
+#endif
                     } else if(matchres == 1) {
-                        if(opts->debug) printf("Tracer: replace address in memory\n");
-                        // Replace network address
-                        if(!ptrace_put_bind_args(target, &regs, socketfd, replacement, addrlen, opts->debug)) {
-                            fprintf(stderr, "force-bind: short write, cannot fit %d bytes into %d\n", addrlen, (socklen_t) regs.rdx);
+                        // Replace network address in the target process memory
+                        if(!ptrace_put_bind_args(target, &regs, socketfd, replacement, addrlen)) {
+                            fprintf(stderr, "force-bind: short write, cannot fit %d bytes into %d\n", addrlen, (int)addrlen);
                             exit(EXIT_FAILURE);
                         }
-
-                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+#if defined(__x86_64__)
+                        if(ptrace(PTRACE_SETREGS, target, 0, &regs) == -1)
+                            errExit("PTRACE_SETREGS");
+#elif defined(__aarch64__)
+                        iov.iov_base = &regs;
+                        iov.iov_len = sizeof(regs);
+                        if (ptrace(PTRACE_SETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+                           errExit("PTRACE_SETREGSET");
+#endif
                     } else if(matchres == 2) {
-                        if(opts->debug) printf("Tracer: replace system-call by dup2(%d, %d)\n", sourcefd, socketfd);
                         struct replaced_fds *replace_fd = malloc(sizeof(struct replaced_fds));
                         if (replace_fd == NULL) {
                             fprintf(stderr, "force-bind: malloc failed\n");
@@ -852,50 +806,88 @@ process_ptrace(pid_t target, struct cmdLineOpts *opts) {
                             replace_fd->fd = socketfd;
                             replaced_fds = replace_fd;
                         }
-                        // Replace file descriptor
-                        // replace orig_rax=__NR_bind rdi=socketfd rsi=addr rdx=addrlen
-                        // with    orig_rax=__NR_dup2 rdi=oldfd    rsi=newfd
+                        /* Replace the syscall with dup2(sourcefd, socketfd) */
+#if defined(__x86_64__)
                         regs.orig_rax = __NR_dup2;
                         regs.rdi      = sourcefd;
                         regs.rsi      = socketfd;
-                        ptrace(PTRACE_SETREGS, target, 0, &regs);
-                        // Run the syscall (will do nothing)
+                        if(ptrace(PTRACE_SETREGS, target, 0, &regs) == -1)
+                            errExit("PTRACE_SETREGS");
                         ptrace(PTRACE_SYSCALL, target, 0, 0);
                         waitpid(target, 0, 0);
-                        // Get registers from dup2() response
-                        ptrace(PTRACE_GETREGS, target, 0, &regs);
-                        // Return 0 on success, else the error
+                        if(ptrace(PTRACE_GETREGS, target, 0, &regs) == -1)
+                            errExit("PTRACE_GETREGS");
                         if(regs.rax > 0) regs.rax = 0;
-                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                        if(ptrace(PTRACE_SETREGS, target, 0, &regs) == -1)
+                            errExit("PTRACE_SETREGS");
+#elif defined(__aarch64__)
+                        regs.regs[8] = __NR_dup3;
+                        regs.regs[0] = sourcefd;
+                        regs.regs[1] = socketfd;
+                        regs.regs[2] = 0;
+                        iov.iov_base = &regs;
+                        iov.iov_len = sizeof(regs);
+                        if (ptrace(PTRACE_SETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+                           errExit("PTRACE_SETREGSET");
+                        ptrace(PTRACE_SYSCALL, target, 0, 0);
+                        waitpid(target, 0, 0);
+                        iov.iov_base = &regs;
+                        iov.iov_len = sizeof(regs);
+                        if (ptrace(PTRACE_GETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+                           errExit("PTRACE_GETREGSET");
+                        if(regs.regs[0] > 0) regs.regs[0] = 0;
+                        iov.iov_base = &regs;
+                        iov.iov_len = sizeof(regs);
+                        if (ptrace(PTRACE_SETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+                           errExit("PTRACE_SETREGSET");
+#endif
                     }
 
                     free(replacement);
                     free(addr);
                     break;
                 }
-                case __NR_listen: {
-                    int fd = regs.rdi;
-                    // Check if the file descriptor was replaced
-                    struct replaced_fds *rfd = replaced_fds;
-                    while(rfd) {
-                        if(rfd->fd == fd) break;
-                        rfd = rfd->next;
-                    }
-                    if(opts->prevent_listen && rfd) {
-                        // ignore listen syscall
-                        if(opts->debug) printf("Tracer: listen(%d, %d), ignoring\n", fd, regs.rsi);
-                        // first change syscall number to -1 (invalid) and run
-                        // it (does nothing)
-                        regs.orig_rax = -1;
-                        ptrace(PTRACE_SETREGS, target, 0, &regs);
-                        ptrace(PTRACE_SYSCALL, target, 0, 0);
-                        waitpid(target, 0, 0);
-                        // Return 0 as if it succeeded
-                        regs.rax = 0;
-                        ptrace(PTRACE_SETREGS, target, 0, &regs);
-                    }
-                    break;
+            }
+            case __NR_listen: {
+                int fd;
+#if defined(__x86_64__)
+                fd = regs.rdi;
+#elif defined(__aarch64__)
+                fd = regs.regs[0];
+#endif
+                // Check if the file descriptor was replaced
+                struct replaced_fds *rfd = replaced_fds;
+                while(rfd) {
+                    if(rfd->fd == fd) break;
+                    rfd = rfd->next;
                 }
+                if(opts->prevent_listen && rfd) {
+                    // Ignore listen syscall by replacing it with a no-op
+#if defined(__x86_64__)
+                    regs.orig_rax = -1;
+                    if(ptrace(PTRACE_SETREGS, target, 0, &regs) == -1)
+                        errExit("PTRACE_SETREGS");
+                    ptrace(PTRACE_SYSCALL, target, 0, 0);
+                    waitpid(target, 0, 0);
+                    regs.rax = 0;
+                    if(ptrace(PTRACE_SETREGS, target, 0, &regs) == -1)
+                        errExit("PTRACE_SETREGS");
+#elif defined(__aarch64__)
+                    regs.regs[8] = -1;
+                    iov.iov_base = &regs;
+                    iov.iov_len = sizeof(regs);
+                    if (ptrace(PTRACE_SETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+                        errExit("PTRACE_SETREGSET");
+                    ptrace(PTRACE_SYSCALL, target, 0, 0);
+                    waitpid(target, 0, 0);
+                    regs.regs[0] = 0;
+                    iov.iov_base = &regs;
+                    iov.iov_len = sizeof(regs);
+                    if (ptrace(PTRACE_SETREGSET, target, (void*)NT_PRSTATUS, &iov) == -1)
+                        errExit("PTRACE_SETREGSET");
+#endif
+                }
+                break;
             }
         }
     }
@@ -946,10 +938,6 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
     };
     struct addrinfo *res;
 
-    if(fullmatch && opts->debug) {
-        printf("parse map %s %s %s\n", matchaddr, prefix, replace);
-    }
-
     if(matchaddr && *matchaddr && matchaddr[0] != ':'){
         err = getaddrinfo2(matchaddr, &hints, &res);
         if(err) {
@@ -958,11 +946,6 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
         }
         cur->addr = copyAddr(res); // FIXME: handle ai_next
         freeaddrinfo(res);
-        if(opts->debug) {
-            char addr[PATH_MAX];
-            printf("parsed map address %s\n",
-                get_ip_str(cur->addr, addr, sizeof(addr)));
-        }
     }
 
     if(replace && *replace){
@@ -972,14 +955,12 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             cur->replacement_fd = fd;
             cur->replacement = NULL;
             //opts->require_ptrace = true;
-            if(opts->debug) printf("parsed replacement fd %d\n", cur->replacement_fd);
         } else if (len > 3 && replace[0] == 's' && replace[1] == 'd' && (replace[2] == '=' || replace[2] == '-')) {
             int sd = atoi(&replace[3]);
             int fd = sd + 3;
             cur->replacement_fd = fd;
             cur->replacement = NULL;
             //opts->require_ptrace = true;
-            if(opts->debug) printf("parsed replacement fd %d (systemd)\n", cur->replacement_fd);
         } else {
             err = getaddrinfo2(replace, &hints, &res);
             if(err) {
@@ -989,10 +970,6 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             cur->replacement = copyAddr(res); // FIXME: handle ai_next
             cur->replacement_fd = 0;
             freeaddrinfo(res);
-            if(opts->debug) {
-                char addr[PATH_MAX];
-                printf("parsed replacement address %s\n", get_ip_str(cur->replacement, addr, sizeof(addr)));
-            }
         }
     }
 
@@ -1017,10 +994,6 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             }
             freeaddrinfo(res);
             num++;
-            if(opts->debug) {
-                char addr[PATH_MAX];
-                printf("parsed map address %s CIDR %d\n", get_ip_str(cur->addr, addr, sizeof(addr)), cur->prefix);
-            }
         }
 
         if(!cur->replacement || cur->replacement->sa_family == AF_INET6) {
@@ -1047,10 +1020,6 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             }
             freeaddrinfo(res);
             num++;
-            if(opts->debug) {
-                char addr[PATH_MAX];
-                printf("parsed map address %s CIDR %d\n", get_ip_str(cur->addr, addr, sizeof(addr)), cur->prefix);
-            }
         }
 
     } else {
@@ -1061,11 +1030,6 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             cur->prefix = 32;
         } else if (cur->addr && cur->addr->sa_family == AF_INET6) {
             cur->prefix = 128;
-        }
-
-        if(opts->debug) {
-            char addr[PATH_MAX];
-            printf("parsed map address %s CIDR %d\n", get_ip_str(cur->addr, addr, sizeof(addr)), cur->prefix);
         }
 
 
@@ -1261,7 +1225,6 @@ usageError(char *msg, char *pname)
         "    -m MATCH=ADDR         Replace bind() matching first MATCH with ADDR\n"
         "    -b ADDR               Replace all bind() with ADDR (if same family)\n"
         "    -d                    Deny all bind()\n"
-        "    -D                    Debug messages\n"
         "    -v                    Verbose\n"
         "    -q                    Quiet\n"
         "    -L                    Block listen(2) for fd-N or sd-N sockets\n"
@@ -1329,7 +1292,6 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
     int opt;
 
     bzero(opts, sizeof(struct cmdLineOpts));
-    opts->debug = false;
     opts->map = NULL;
     opts->require_ptrace = false;
     opts->prevent_listen = false;
@@ -1351,9 +1313,6 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
 
         } else if(!strcmp("-p", arg)) {              /* Ptrace */
             opts->require_ptrace = true;
-
-        } else if(!strcmp("-D", arg)) {              /* Debug */
-            opts->debug = true;
 
         } else if(!strcmp("-q", arg)) {              /* Quiet */
             opts->quiet = true;
@@ -1425,19 +1384,14 @@ main(int argc, char *argv[])
        that arrive on that file descriptor. */
 
     if (opts.require_ptrace) {
-        if(opts.debug) printf("Tracer: use seccomp-ptrace method\n");
-
         /* Wait for the target process to signal STOP
          */
         int status;
         waitpid(targetPid, &status, 0);
-
         ptrace(PTRACE_SETOPTIONS, targetPid, 0, PTRACE_O_TRACESECCOMP);
         exit(process_ptrace(targetPid, &opts));
 
     } else {
-
-        if(opts.debug) printf("Tracer: use seccomp-only method\n");
         tracerPid = tracerProcess(sockPair, &opts);
 
         /* The parent process does not need the socket pair */
@@ -1448,11 +1402,7 @@ main(int argc, char *argv[])
 
         int status;
         waitpid(targetPid, &status, 0);
-        if(opts.debug) printf("Parent: target process has terminated\n");
-
         /* After the target process has terminated, kill the tracer process */
-
-        if(opts.debug) printf("Parent: killing tracer\n");
         kill(tracerPid, SIGTERM);
 
         if (!WIFEXITED(status)) exit(EXIT_FAILURE);
