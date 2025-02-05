@@ -159,48 +159,52 @@ struct cmdLineOpts {
 
 static int matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *newfd, const struct cmdLineOpts *opts);
 
-/* The following is the x86-64-specific BPF boilerplate code for checking that
-   the BPF program is running on the right architecture + ABI. At completion
-   of these instructions, the accumulator contains the system call number. */
+/* The following is the architecture-specific BPF boilerplate code for checking that
+   the BPF program is running on the right architecture and ABI. At completion of these
+   instructions, the accumulator contains the system call number. */
 
-/* For the x32 ABI, all system call numbers have bit 30 set */
-
+/* For x86-64 with the x32 ABI, all system call numbers have bit 30 set */
 #define X32_SYSCALL_BIT         0x40000000
 
-#define X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR \
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, \
-                (offsetof(struct seccomp_data, arch))), \
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 2), \
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, \
-                 (offsetof(struct seccomp_data, nr))), \
-        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1), \
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS)
+#define ARCH_CHECK_AND_LOAD_SYSCALL_NR                                                            \
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, arch))),                \
+        /* If architecture is AArch64, jump directly to the AArch64 block */                      \
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 6, 0),                            \
+        /* Else if architecture is x86-64, jump to the x86 block (which performs an x32 check) */ \
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),                             \
+        /* Unrecognized architecture: kill the process */                                         \
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),                                      \
+        /* x86-64 block: load system call number */                                               \
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, nr))),                  \
+        /* For x86-64: if the system call number has the x32 bit set, kill the process */         \
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1),                               \
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),                                      \
+        /* Skip over the AArch64 block if coming from the x86-64 block */                         \
+        BPF_JUMP(BPF_JMP | BPF_JA, 0, 0, 1),                                                      \
+        /* AArch64 block: load system call number (no x32 check needed) */                        \
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, nr)))
 
 /* installNotifyFilter() installs a seccomp filter that generates user-space
-   notifications (SECCOMP_RET_USER_NOTIF) when the process calls bind(2); the
-   filter allows all other system calls.
-
-   The function return value is a file descriptor from which the user-space
-   notifications can be fetched. */
-
+   notifications (SECCOMP_RET_USER_NOTIF) when the process calls bind(2) or listen(2);
+   all other system calls are allowed.
+   The function returns a file descriptor from which the user-space notifications
+   can be fetched.
+*/
 static int
 installNotifyFilter(void)
 {
     struct sock_filter filter[] = {
-        X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR,
+        ARCH_CHECK_AND_LOAD_SYSCALL_NR,
 
         /* bind() triggers notification to user-space tracer */
-
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
         BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
 
         /* listen() triggers notification to user-space tracer */
-
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
         BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
 
         /* Every other system call is allowed */
-
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
 
@@ -211,35 +215,32 @@ installNotifyFilter(void)
 
     int notifyFd;
 
-    /* Install the filter with the SECCOMP_FILTER_FLAG_NEW_LISTENER flag; as
-       a result, seccomp() returns a notification file descriptor. */
-
+    /* Install the filter with the SECCOMP_FILTER_FLAG_NEW_LISTENER flag; seccomp()
+       returns a notification file descriptor as a result. */
     notifyFd = seccomp(SECCOMP_SET_MODE_FILTER,
-                        SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
+                       SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
     if (notifyFd == -1)
         errExit("seccomp-install-notify-filter");
 
     return notifyFd;
 }
 
+
 static void
 installPtraceFilter(void)
 {
     struct sock_filter filter[] = {
-        X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR,
+        ARCH_CHECK_AND_LOAD_SYSCALL_NR,
 
         /* bind() triggers notification to user-space tracer */
-
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
         BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE),
 
         /* listen() triggers notification to user-space tracer */
-
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
         BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE),
 
         /* Every other system call is allowed */
-
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
 

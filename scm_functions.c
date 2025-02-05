@@ -1,5 +1,5 @@
 /*************************************************************************\
-*                  Copyright (C) Michael Kerrisk, 2019.                   *
+*                  Copyright (C) Michael Kerrisk, 2024.                   *
 *                                                                         *
 * This program is free software. You may use, modify, and redistribute it *
 * under the terms of the GNU Lesser General Public License as published   *
@@ -7,6 +7,8 @@
 * any later version. This program is distributed without any warranty.    *
 * See the files COPYING.lgpl-v3 and COPYING.gpl-v3 for details.           *
 \*************************************************************************/
+
+/* Supplementary program for Chapter 61 */
 
 /* scm_functions.c
 
@@ -18,6 +20,8 @@
    channel and the ancillary data, with some kind of protocol that
    determines how the "real" and ancillary data are used together.
 */
+#include <string.h>
+#include <errno.h>
 #include "scm_functions.h"
 
 /* Send the file descriptor 'fd' over the connected UNIX domain socket
@@ -26,11 +30,6 @@
 int
 sendfd(int sockfd, int fd)
 {
-    struct msghdr msgh;
-    struct iovec iov;
-    int data;
-    struct cmsghdr *cmsgp;
-
     /* Allocate a char array of suitable size to hold the ancillary data.
        However, since this buffer is in reality a 'struct cmsghdr', use a
        union to ensure that it is aligned as required for that structure.
@@ -49,6 +48,7 @@ sendfd(int sockfd, int fd)
        need to use this field because we presume that 'sockfd' is a
        connected socket. */
 
+    struct msghdr msgh;
     msgh.msg_name = NULL;
     msgh.msg_namelen = 0;
 
@@ -56,11 +56,14 @@ sendfd(int sockfd, int fd)
        order to send ancillary data. We transmit an arbitrary integer
        whose value is ignored by recvfd(). */
 
-    msgh.msg_iov = &iov;
-    msgh.msg_iovlen = 1;
+    struct iovec iov;
+    int data;
+
+    data = 12345;
     iov.iov_base = &data;
     iov.iov_len = sizeof(int);
-    data = 12345;
+    msgh.msg_iov = &iov;
+    msgh.msg_iovlen = 1;
 
     /* Set 'msghdr' fields that describe ancillary data */
 
@@ -69,11 +72,12 @@ sendfd(int sockfd, int fd)
 
     /* Set up ancillary data describing file descriptor to send */
 
+    struct cmsghdr *cmsgp;
     cmsgp = CMSG_FIRSTHDR(&msgh);
     cmsgp->cmsg_level = SOL_SOCKET;
     cmsgp->cmsg_type = SCM_RIGHTS;
     cmsgp->cmsg_len = CMSG_LEN(sizeof(int));
-    *((int *) CMSG_DATA(cmsgp)) = fd;
+    memcpy(CMSG_DATA(cmsgp), &fd, sizeof(int));
 
     /* Send real plus ancillary data */
 
@@ -91,7 +95,7 @@ recvfd(int sockfd)
 {
     struct msghdr msgh;
     struct iovec iov;
-    int data;
+    int data, fd;
     ssize_t nr;
 
     /* Allocate a char buffer for the ancillary data. See the comments
@@ -140,5 +144,7 @@ recvfd(int sockfd)
 
     /* Return the received file descriptor to our caller */
 
-    return *((int *) CMSG_DATA(cmsgp));
+    memcpy(&fd, CMSG_DATA(cmsgp), sizeof(int));
+    return fd;
 }
+
