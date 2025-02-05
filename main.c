@@ -438,44 +438,23 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               break;
           }
           case __NR_bind: {
-              /* Access the memory of the target process in order to discover
-                 the syscall arguments */
-
-              snprintf(path, sizeof(path), "/proc/%d/mem", req->pid);
-
-              procMem = open(path, O_RDWR);
-              if (procMem == -1)
-                errExit("Tracer: open");
-
               /* Check that the process whose info we are accessing is still alive */
-
               checkNotificationIdIsValid(notifyFd, req->id, "post-open", opts);
 
               /* Since, the SECCOMP_IOCTL_NOTIF_ID_VALID operation (performed in
                  checkNotificationIdIsValid()) succeeded, we know that the
                  /proc/PID/mem file descriptor that we opened corresponded to the
                  process for which we received a notification. If that process
-                 subsequently terminates, then read() on that file descriptor will
+                 subsequentlyeterminates, then read() on that file descriptor will
                  return 0 (EOF). */
 
               int socketfd = req->data.args[0];
               intptr_t addrptr = req->data.args[1];
               size_t addrlen = req->data.args[2];
 
-              if (lseek(procMem, addrptr, SEEK_SET) == -1)
-                errExit("Tracer: lseek");
-
               addr = malloc(addrlen);
               if (resp == NULL)
                 errExit("Tracer: malloc");
-
-              ssize_t s = read(procMem, addr, addrlen);
-              if (s == -1)
-                errExit("read");
-              else if (s == 0) {
-                fprintf(stderr, "Tracer: read returned EOF\n");
-                exit(EXIT_FAILURE);
-              }
 
               /* The response to the notification includes the notification ID */
 
@@ -495,7 +474,6 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                 resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
               } else {
-
                 /* In this branch, the bind() syscall was performed on INET or
                  * INET6 addresses */
 
@@ -524,6 +502,12 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   addfd.newfd_flags = 0;
                   int targetFd = ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
 
+                  if(!opts->quiet) {
+                    char addrstring[PATH_MAX];
+                    char repladdrstring[PATH_MAX];
+                    printf("force-bind: replace %s with FD %d\n", socketfd);
+                  }
+
                   struct replaced_fds *replace_fd = malloc(sizeof(struct replaced_fds));
                   if (replace_fd == NULL) {
                       fprintf(stderr, "force-bind: malloc failed\n");
@@ -538,32 +522,49 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   resp->error = (targetFd < 0) ? -errno : 0;
                   resp->val   = targetFd;
                 } else if(matchres == 1) {
-                  char addrstring[PATH_MAX];
-                  char repladdrstring[PATH_MAX];
-                  if(!opts->quiet) printf("force-bind: replace %s with %s\n",
-                      get_ip_str(addr, addrstring, sizeof(addrstring)),
-                      get_ip_str(replacement, repladdrstring, sizeof(repladdrstring)));
+                  /* Access the memory of the target process in order to discover
+                     the syscall arguments */
+                  snprintf(path, sizeof(path), "/proc/%d/mem", req->pid);
+                  procMem = open(path, O_RDWR);
+                  if (procMem == -1)
+                    errExit("Tracer: open /proc/PID/mem O_RDWR");
 
                   if (lseek(procMem, addrptr, SEEK_SET) == -1)
-                    errExit("force-bind: lseek");
+                    errExit("Tracer: lseek /proc/PID/mem");
 
-                  ssize_t s = write(procMem, replacement, addrlen);
-                  if (s == -1)
-                    errExit("read");
-                  else if (s != addrlen) {
-                    fprintf(stderr, "force-bind: short write\n");
-                    exit(EXIT_FAILURE);
+                  ssize_t s = read(procMem, addr, addrlen);
+                  if (s == -1) {
+                    errExit("Tracer: read /proc/PID/mem");
+                  } else if (s == 0) {
+                    errExit("Tracer: read returned EOF");
                   }
 
-                  free(replacement);
+                  if(!opts->quiet) {
+                    char addrstring[PATH_MAX];
+                    char repladdrstring[PATH_MAX];
+                    printf("force-bind: replace %s with %s\n",
+                      get_ip_str(addr, addrstring, sizeof(addrstring)),
+                      get_ip_str(replacement, repladdrstring, sizeof(repladdrstring)));
+                  }
+
+                  if (lseek(procMem, addrptr, SEEK_SET) == -1)
+                    errExit("Tracer: lseek");
+
+                  s = write(procMem, replacement, addrlen);
+                  if (s == -1) {
+                    errExit("read");
+                  } else if (s != addrlen) {
+                    errExit("Tracer: short write\n");
+                  }
+
+                  if (close(procMem) == -1)
+                    errExit("Tracer: close /proc/PID/mem");
                 }
 
+                free(replacement);
               }
 
               free(addr);
-
-              if (close(procMem) == -1)
-                errExit("close-/proc/PID/mem");
               break;
             }
         }
