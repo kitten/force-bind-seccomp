@@ -128,7 +128,7 @@
 static int
 seccomp(unsigned int operation, unsigned int flags, void *args)
 {
-    return syscall(__NR_seccomp, operation, flags, args);
+    return syscall(SYS_seccomp, operation, flags, args);
 }
 
 struct replaced_fds;
@@ -172,13 +172,13 @@ static int matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *new
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 6, 0),                            \
         /* Else if architecture is x86-64, jump to the x86 block (which performs an x32 check) */ \
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),                             \
-        /* Unrecognized architecture: kill the process */                                         \
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),                                      \
+        /* Unrecognized architecture: return error */                                             \
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),                \
         /* x86-64 block: load system call number */                                               \
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, nr))),                  \
         /* For x86-64: if the system call number has the x32 bit set, kill the process */         \
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1),                               \
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),                                      \
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),                \
         /* Skip over the AArch64 block if coming from the x86-64 block */                         \
         BPF_JUMP(BPF_JMP | BPF_JA, 0, 0, 1),                                                      \
         /* AArch64 block: load system call number (no x32 check needed) */                        \
@@ -198,11 +198,11 @@ installNotifyFilter(void)
 
         /* bind() triggers notification to user-space tracer */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
-        BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
 
         /* listen() triggers notification to user-space tracer */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
-        BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
 
         /* Every other system call is allowed */
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
@@ -213,13 +213,10 @@ installNotifyFilter(void)
         .filter = filter,
     };
 
-    int notifyFd;
-
     /* Install the filter with the SECCOMP_FILTER_FLAG_NEW_LISTENER flag; seccomp()
        returns a notification file descriptor as a result. */
-    notifyFd = seccomp(SECCOMP_SET_MODE_FILTER,
-                       SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
-    if (notifyFd == -1)
+    int notifyFd = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
+    if (notifyFd < 0)
         errExit("seccomp-install-notify-filter");
 
     return notifyFd;
@@ -256,7 +253,7 @@ installPtraceFilter(void)
         errExit("prctl(PR_SET_NO_NEW_PRIVS)");
     }
 
-    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == -1) {
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0) {
         errExit("when setting seccomp filter");
     }
 }
@@ -492,32 +489,35 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               int socketfd = req->data.args[0];
               intptr_t addrptr = req->data.args[1];
               size_t addrlen = req->data.args[2];
+              if(opts->verbose) {
+                printf("force-bind: notified of __NR_bind on fork FD %d\n", socketfd);
+              }
 
               addr = malloc(addrlen);
-              if (resp == NULL)
+              if (addr == NULL)
                 errExit("Tracer: malloc");
               if (target_memcpy(&addr, req->pid, (void*) addrptr, addrlen) < 0) {
                 // abort nicely
-                fprintf(stderr, "Tracer: target_memcpy (arch: %d, ptr: %lld) [%s]\n", req->data.arch, addrptr, strerror(errno));
+                fprintf(stderr, "Tracer: target_memcpy (arch: %d, ptr: %ld) [%s]\n", req->data.arch, addrptr, strerror(errno));
                 free(addr);
                 resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
                 break;
               }
 
-              if(!opts->verbose) {
+              if(opts->verbose) {
                 char addrstring[PATH_MAX];
+                printf("force-bind: notified of __NR_bind on family %d\n", addr->sa_family);
                 printf("force-bind: notified of __NR_bind on %s\n",
                   get_ip_str(addr, addrstring, sizeof(addrstring)));
               }
 
               if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
-
+                printf("force-bind: ignoring unknown family %d\n", addr->sa_family);
                 /* In this branch, the bind() syscall was performed on addresses
                  * that are neither INET nor INET6, don't alter */
 
                 /* Continue the syscall. This is not secure at all, but we don't
                  * care for now */
-
                 resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
               } else {
                 /* In this branch, the bind() syscall was performed on INET or
@@ -553,6 +553,10 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   addfd.flags = SECCOMP_ADDFD_FLAG_SETFD;
                   addfd.newfd_flags = 0;
                   int targetFd = ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
+                  if (targetFd < 0) {
+                    printf("force-bind: Cannot replace socket %d with %d: %s\n", socketfd, newfd);
+                    perror("force-bind: Cannot replace socket");
+                  }
                   resp->flags = 0;
                   resp->error = (targetFd < 0) ? -errno : 0;
                   resp->val   = targetFd;
@@ -1078,7 +1082,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
 
 
         if(cur->addr && cur->replacement && cur->addr->sa_family != cur->replacement->sa_family) {
-            fprintf(stderr, "Not the same address family on both sides: %s", map0);
+            fprintf(stderr, "Not the same address family on both sides: %s\n", map0);
             exit(EXIT_FAILURE);
         }
 
@@ -1438,16 +1442,7 @@ main(int argc, char *argv[])
         ptrace(PTRACE_SETOPTIONS, targetPid, 0, PTRACE_O_TRACESECCOMP);
         exit(process_ptrace(targetPid, &opts));
     } else {
-        ptrace(PTRACE_SEIZE, targetPid, 0, 0);
-
         tracerProcess(sockPair, &opts);
-
-        /* Wait for the target process to terminate */
-        int status;
-        waitpid(targetPid, &status, 0);
-
-        if (!WIFEXITED(status)) exit(EXIT_FAILURE);
-        exit(WEXITSTATUS(status));
     }
 
     exit(EXIT_SUCCESS);
