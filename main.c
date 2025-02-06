@@ -367,6 +367,39 @@ checkNotificationIdIsValid(int notifyFd, __u64 id, char *tag, struct cmdLineOpts
     }
 }
 
+void
+allocSeccompNotifBuffers(struct seccomp_notif **req, struct seccomp_notif_resp **resp, struct seccomp_notif_sizes *sizes)
+{
+    /* Discover the sizes of the structures that are used to receive
+       notifications and send notification responses, and allocate
+       buffers of those sizes. */
+
+    if (seccomp(SECCOMP_GET_NOTIF_SIZES, 0, sizes) == -1)
+        errExit("seccomp-SECCOMP_GET_NOTIF_SIZES");
+
+    *req = malloc(sizes->seccomp_notif);
+    if (*req == NULL)
+        errExit("malloc-seccomp_notif");
+
+    /* When allocating the response buffer, we must allow for the fact
+       that the user-space binary may have been built with user-space
+       headers where 'struct seccomp_notif_resp' is bigger than the
+       response buffer expected by the (older) kernel. Therefore, we
+       allocate a buffer that is the maximum of the two sizes. This
+       ensures that if the supervisor places bytes into the response
+       structure that are past the response size that the kernel expects,
+       then the supervisor is not touching an invalid memory location. */
+
+    size_t resp_size = sizes->seccomp_notif_resp;
+    if (sizeof(struct seccomp_notif_resp) > resp_size)
+        resp_size = sizeof(struct seccomp_notif_resp);
+
+    *resp = malloc(resp_size);
+    if (resp == NULL)
+        errExit("malloc-seccomp_notif_resp");
+
+}
+
 /* Handle notifications that arrive via SECCOMP_RET_USER_NOTIF file
    descriptor, 'notifyFd'. */
 
@@ -382,37 +415,25 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
     char path[PATH_MAX];
     int procMem;        /* FD for /proc/PID/mem of target process */
 
-    /* Discover the sizes of the structures that are used to receive
-       notifications and send notification responses, and allocate
-       buffers of those sizes. */
-
-    if (seccomp(SECCOMP_GET_NOTIF_SIZES, 0, &sizes) == -1)
-        errExit("Tracer: seccomp-SECCOMP_GET_NOTIF_SIZES");
-
-    req = malloc(sizes.seccomp_notif);
-    if (req == NULL)
-        errExit("Tracer: malloc");
-
-    resp = malloc(sizes.seccomp_notif_resp);
-    if (resp == NULL)
-        errExit("Tracer: malloc");
+    allocSeccompNotifBuffers(&req, &resp, &sizes);
 
     /* Loop handling notifications */
 
     for (;;) {
       /* Wait for next notification, returning info in '*req' */
+      memset(req, 0, sizes.seccomp_notif); /* Required since Linux 5.5 */
 
-      bzero(req, sizes.seccomp_notif);
-      bzero(resp, sizes.seccomp_notif_resp);
+      if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_RECV, req) == -1) {
+        if (errno == EINTR) continue;
+        errExit("Tracer: ioctl-SECCOMP_IOCTL_NOTIF_RECV");
+      }
 
-      if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_RECV, req) == -1)
-          errExit("Tracer: ioctlSECCOMP_IOCTL_NOTIF_RECV");
+      resp->id = req->id;
+      resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE; /* Allow syscall */
+      resp->val = 0; /* Success return value is 0 */
+      resp->error = 0;
 
       switch(req->data.nr) {
-          default:
-              fprintf(stderr, "seccomp: got unexpected syscall %d", req->data.nr);
-              exit(EXIT_FAILURE);
-
           case __NR_listen: {
 
               int fd = req->data.args[0];
@@ -423,12 +444,6 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   if(rfd->fd == fd) break;
                   rfd = rfd->next;
               }
-
-              resp->id = req->id;
-              resp->flags = 0;        /* Must be zero as at Linux 5.0 */
-              resp->val = 0;          /* Success return value is 0 */
-              resp->error = 0;
-              resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
               if(opts->prevent_listen && rfd) {
                   // Ignore syscall
@@ -459,8 +474,8 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               /* The response to the notification includes the notification ID */
 
               resp->id = req->id;
-              resp->flags = 0;        /* Must be zero as at Linux 5.0 */
-              resp->val = 0;          /* Success return value is 0 */
+              resp->flags = 0; // Must be zero as at Linux 5.0
+              resp->val = 0; // Success return value is 0
               resp->error = 0;
 
               if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
@@ -472,15 +487,9 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                  * care for now */
 
                 resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-
               } else {
                 /* In this branch, the bind() syscall was performed on INET or
                  * INET6 addresses */
-
-                /* Continue the syscall. ideally we should filter the IP address and
-                 * make sure it is allowed, but this is not yet implemented */
-
-                resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
                 struct sockaddr *replacement = malloc(addrlen);
                 if (replacement == NULL)
@@ -490,10 +499,20 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                 int newfd;
                 // FIXME: handle multiple replacement
                 int matchres = matchAllAddr(opts->map, replacement, &newfd, opts);
-                if(matchres < 0) {
-                  resp->flags = 0;
-                  resp->error = -matchres;
-                } else if(matchres == 2) {
+                if (matchres < 0) {
+                  resp->error = -matchres; // Pass on matching error
+                } else if (matchres == 0) {
+                  /* Continue the syscall. ideally we should filter the IP address and
+                   * make sure it is allowed, but this is not yet implemented */
+                  resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+
+                  if(!opts->quiet) {
+                    char addrstring[PATH_MAX];
+                    printf("force-bind: unmatched %s\n",
+                      get_ip_str(addr, addrstring, sizeof(addrstring)),
+                      socketfd);
+                  }
+                } else if (matchres == 2) {
                   struct seccomp_notif_addfd addfd;
                   addfd.id = req->id; /* Cookie from SECCOMP_IOCTL_NOTIF_RECV */
                   addfd.srcfd = newfd;
@@ -501,11 +520,14 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   addfd.flags = SECCOMP_ADDFD_FLAG_SETFD;
                   addfd.newfd_flags = 0;
                   int targetFd = ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
+                  resp->error = (targetFd < 0) ? -errno : 0;
+                  resp->val   = targetFd;
 
                   if(!opts->quiet) {
                     char addrstring[PATH_MAX];
-                    char repladdrstring[PATH_MAX];
-                    printf("force-bind: replace %s with FD %d\n", socketfd);
+                    printf("force-bind: replace %s with FD %d\n",
+                      get_ip_str(addr, addrstring, sizeof(addrstring)),
+                      socketfd);
                   }
 
                   struct replaced_fds *replace_fd = malloc(sizeof(struct replaced_fds));
@@ -518,10 +540,10 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                       replaced_fds = replace_fd;
                   }
 
-                  resp->flags = 0;
-                  resp->error = (targetFd < 0) ? -errno : 0;
-                  resp->val   = targetFd;
+                  close(newfd); /* No longer needed in supervisor after reassignment */
                 } else if(matchres == 1) {
+                  resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+
                   /* Access the memory of the target process in order to discover
                      the syscall arguments */
                   snprintf(path, sizeof(path), "/proc/%d/mem", req->pid);
@@ -566,7 +588,11 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 
               free(addr);
               break;
-            }
+          }
+
+          default:
+              fprintf(stderr, "seccomp: got unexpected syscall %d", req->data.nr);
+              exit(EXIT_FAILURE);
         }
 
         /* Provide a response to the target process */
@@ -1086,6 +1112,9 @@ matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmd
             /* check port number */
             if (addr->sin_port == 0) return false; // Never match outgoing connections
             if (map_addr->sin_port != 0 && map_addr->sin_port != addr->sin_port) return false;
+
+            /* match any address that's marked as ANY */
+            if (addr->sin_addr.s_addr == htonl(INADDR_ANY)) return true;
 
             /* check network IP */
             struct in_addr net_addr = netAddrIpv4(map->prefix, &addr->sin_addr);
