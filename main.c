@@ -326,6 +326,7 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
          */
         kill(getpid(), SIGSTOP);
     } else {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
             errExit("prctl");
 
@@ -400,6 +401,23 @@ allocSeccompNotifBuffers(struct seccomp_notif **req, struct seccomp_notif_resp *
 
 }
 
+ssize_t ptrace_memcpy(pid_t pid, intptr_t addr, void *buf, size_t len) {
+    size_t i;
+    long word;
+    ssize_t bytes_read = 0;
+    unsigned char *ptr = (unsigned char *)buf;
+    for (i = 0; i < len; i += sizeof(long)) {
+        word = ptrace(PTRACE_PEEKDATA, pid, addr + i, NULL);
+        if (word == -1 && errno != 0) {
+            return -1;
+        }
+        size_t chunk_size = (len - i) < sizeof(long) ? (len - i) : sizeof(long);
+        memcpy(ptr + i, &word, chunk_size);
+        bytes_read += chunk_size;
+    }
+    return bytes_read;
+}
+
 /* Handle notifications that arrive via SECCOMP_RET_USER_NOTIF file
    descriptor, 'notifyFd'. */
 
@@ -435,8 +453,10 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 
       switch(req->data.nr) {
           case __NR_listen: {
-
               int fd = req->data.args[0];
+              if(opts->verbose) {
+                printf("force-bind: notified of __NR_listen on FD %d\n", fd);
+              }
 
               // Check if the file descriptor was replaced
               struct replaced_fds *rfd = replaced_fds;
@@ -456,13 +476,6 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               /* Check that the process whose info we are accessing is still alive */
               checkNotificationIdIsValid(notifyFd, req->id, "post-open", opts);
 
-              /* Since, the SECCOMP_IOCTL_NOTIF_ID_VALID operation (performed in
-                 checkNotificationIdIsValid()) succeeded, we know that the
-                 /proc/PID/mem file descriptor that we opened corresponded to the
-                 process for which we received a notification. If that process
-                 subsequentlyeterminates, then read() on that file descriptor will
-                 return 0 (EOF). */
-
               int socketfd = req->data.args[0];
               intptr_t addrptr = req->data.args[1];
               size_t addrlen = req->data.args[2];
@@ -470,6 +483,14 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               addr = malloc(addrlen);
               if (resp == NULL)
                 errExit("Tracer: malloc");
+              if (ptrace_memcpy(req->pid, addrptr, &addr, addrlen) < 0)
+                errExit("Tracer: ptrace_memcpy");
+
+              if(!opts->verbose) {
+                char addrstring[PATH_MAX];
+                printf("force-bind: notified of __NR_bind on %s\n",
+                  get_ip_str(addr, addrstring, sizeof(addrstring)));
+              }
 
               /* The response to the notification includes the notification ID */
 
@@ -617,29 +638,13 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 static pid_t
 tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
 {
-    pid_t tracerPid;
-
-    tracerPid = fork();
-    if (tracerPid == -1)
-        errExit("fork");
-
-    if (tracerPid > 0)          /* In parent, return PID of child */
-        return tracerPid;
-
-    /* Child falls through to here */
-    /* Receive the notification file descriptor from the target process */
-
-    int notifyFd = recvfd(sockPair[1]);
-    if (notifyFd == -1)
-        errExit("recvfd");
-
-    closeSocketPair(sockPair);  /* We no longer need the socket pair */
-
-    /* Handle notifications */
-
-    watchForNotifications(notifyFd, opts);
-
-    exit(EXIT_SUCCESS);         /* NOTREACHED */
+  int notifyFd = recvfd(sockPair[1]);
+  if (notifyFd == -1)
+      errExit("recvfd");
+  /* We no longer need the socket pair */
+  closeSocketPair(sockPair);
+  /* Handle notifications */
+  watchForNotifications(notifyFd, opts);
 }
 
 static int
@@ -1421,18 +1426,14 @@ main(int argc, char *argv[])
         waitpid(targetPid, &status, 0);
         ptrace(PTRACE_SETOPTIONS, targetPid, 0, PTRACE_O_TRACESECCOMP);
         exit(process_ptrace(targetPid, &opts));
-
     } else {
-        tracerPid = tracerProcess(sockPair, &opts);
-
-        /* The parent process does not need the socket pair */
-
-        closeSocketPair(sockPair);
-
-        /* Wait for the target process to terminate */
-
+        /* Wait for the target process to start up and let it continue */
         int status;
         waitpid(targetPid, &status, 0);
+        ptrace(PTRACE_CONT, targetPid, NULL, NULL);
+
+        tracerPid = tracerProcess(sockPair, &opts);
+
         /* After the target process has terminated, kill the tracer process */
         kill(tracerPid, SIGTERM);
 
