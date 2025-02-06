@@ -204,6 +204,14 @@ installNotifyFilter(void)
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
 
+        /* close() triggers notification to user-space tracer */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_close, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+
+        /* connect() triggers notification to user-space tracer */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_connect, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+
         /* Every other system call is allowed */
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
@@ -360,7 +368,7 @@ static void
 checkNotificationIdIsValid(int notifyFd, __u64 id, char *tag, struct cmdLineOpts *opts)
 {
     if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == -1) {
-        fprintf(stderr, "Tracer: notification ID check (%s): target has died\n", tag);
+        printf("Tracer: notification ID check (%s): target has died\n", tag);
     }
 }
 
@@ -436,7 +444,6 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
     struct seccomp_notif *req;
     struct seccomp_notif_resp *resp;
     struct seccomp_notif_sizes sizes;
-    socklen_t addrlen;
     struct sockaddr *addr;
     char path[PATH_MAX];
     int procMem;        /* FD for /proc/PID/mem of target process */
@@ -476,7 +483,47 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               if(opts->prevent_listen && rfd) {
                   // Ignore syscall
                   resp->flags = 0;
-                  if(opts->verbose) printf("force-bind: ignore listen(%lld, %lld)\n", req->data.args[0], req->data.args[1]);
+                  if(opts->verbose) printf("force-bind: ignore listen(%lld)\n", fd);
+              } else {
+                  resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+              }
+              break;
+          }
+          case __NR_close: {
+              int fd = req->data.args[0];
+              // Check if the file descriptor was replaced
+              struct replaced_fds *rfd = replaced_fds;
+              while(rfd) {
+                  if(rfd->fd == fd) break;
+                  rfd = rfd->next;
+              }
+
+              if(rfd) {
+                  // Ignore syscall
+                  resp->flags = 0;
+                  if(opts->verbose) printf("force-bind: ignore close(%lld)\n", fd);
+              } else {
+                  resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+              }
+              break;
+          }
+          case __NR_connect: {
+              int fd = req->data.args[0];
+              if(opts->verbose) {
+                printf("force-bind: notified of __NR_connect on FD %d\n", fd);
+              }
+
+              // Check if the file descriptor was replaced
+              struct replaced_fds *rfd = replaced_fds;
+              while(rfd) {
+                  if(rfd->fd == fd) break;
+                  rfd = rfd->next;
+              }
+
+              if(rfd) {
+                  // Ignore syscall
+                  resp->flags = 0;
+                  if(opts->verbose) printf("force-bind: ignore connect(%lld)\n", fd);
               } else {
                   resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
               }
@@ -496,9 +543,9 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               addr = malloc(addrlen);
               if (addr == NULL)
                 errExit("Tracer: malloc");
-              if (target_memcpy(&addr, req->pid, (void*) addrptr, addrlen) < 0) {
+              if (target_memcpy(addr, req->pid, (void*) addrptr, addrlen) < 0) {
                 // abort nicely
-                fprintf(stderr, "Tracer: target_memcpy (arch: %d, ptr: %ld) [%s]\n", req->data.arch, addrptr, strerror(errno));
+                printf("force-bind: target_memcpy (arch: %d, ptr: %ld) [%s]\n", req->data.arch, addrptr, strerror(errno));
                 free(addr);
                 resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
                 break;
@@ -528,11 +575,11 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   errExit("Tracer: malloc");
                 memcpy(replacement, addr, addrlen);
 
-                int newfd;
+                int srcfd;
                 // FIXME: handle multiple replacement
-                int matchres = matchAllAddr(opts->map, replacement, &newfd, opts);
+                int matchres = matchAllAddr(opts->map, replacement, &srcfd, opts);
                 if (matchres < 0) {
-                  resp->error = -matchres; // Pass on matching error
+                  resp->error = -matchres;
                   resp->flags = 0;
                 } else if (matchres == 0) {
                   /* Continue the syscall. ideally we should filter the IP address and
@@ -546,15 +593,19 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                       socketfd);
                   }
                 } else if (matchres == 2) {
+                  int srcfd_flags = fcntl(srcfd, F_GETFD);
+                  int newfd_flags = fcntl(socketfd, F_GETFD);
+                  printf("force-bind: srcfd_flags = %d newfd_flags = %d\n", srcfd_flags, newfd_flags);
+
                   struct seccomp_notif_addfd addfd;
                   addfd.id = req->id; /* Cookie from SECCOMP_IOCTL_NOTIF_RECV */
-                  addfd.srcfd = newfd;
+                  addfd.srcfd = srcfd;
                   addfd.newfd = socketfd;
                   addfd.flags = SECCOMP_ADDFD_FLAG_SETFD;
-                  addfd.newfd_flags = 0;
+                  addfd.newfd_flags = O_CLOEXEC;
                   int targetFd = ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
                   if (targetFd < 0) {
-                    printf("force-bind: Cannot replace socket %d with %d: %s\n", socketfd, newfd);
+                    printf("force-bind: Cannot replace socket %d with %d: %s\n", socketfd, srcfd);
                     perror("force-bind: Cannot replace socket");
                   }
                   resp->flags = 0;
@@ -570,15 +621,13 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 
                   struct replaced_fds *replace_fd = malloc(sizeof(struct replaced_fds));
                   if (replace_fd == NULL) {
-                      fprintf(stderr, "force-bind: malloc failed\n");
+                      printf("force-bind: malloc failed\n");
                   } else {
                       bzero(replace_fd, sizeof(struct replaced_fds));
                       replace_fd->next = replaced_fds;
                       replace_fd->fd = targetFd;
                       replaced_fds = replace_fd;
                   }
-
-                  close(newfd); /* No longer needed in supervisor after reassignment */
                 } else if(matchres == 1) {
                   resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
@@ -629,14 +678,14 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
           }
 
           default:
-              fprintf(stderr, "seccomp: got unexpected syscall %d\n", req->data.nr);
+              printf("seccomp: got unexpected syscall %d\n", req->data.nr);
               exit(EXIT_FAILURE);
         }
 
         /* Provide a response to the target process */
         if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_SEND, resp) == -1) {
           if (errno == ENOENT) {
-            fprintf(stderr, "Tracer: response failed with ENOENT; perhaps target "
+            printf("Tracer: response failed with ENOENT; perhaps target "
                 "process's syscall was interrupted by signal?\n");
           } else {
             perror("ioctl-SECCOMP_IOCTL_NOTIF_SEND");
@@ -832,7 +881,7 @@ static int process_ptrace(pid_t target, struct cmdLineOpts *opts) {
                     } else if(matchres == 1) {
                         // Replace network address in the target process memory
                         if(!ptrace_put_bind_args(target, &regs, socketfd, replacement, addrlen)) {
-                            fprintf(stderr, "force-bind: short write, cannot fit %d bytes into %d\n", addrlen, (int)addrlen);
+                            printf("force-bind: short write, cannot fit %d bytes into %d\n", addrlen, (int)addrlen);
                             exit(EXIT_FAILURE);
                         }
 #if defined(__x86_64__)
@@ -847,7 +896,7 @@ static int process_ptrace(pid_t target, struct cmdLineOpts *opts) {
                     } else if(matchres == 2) {
                         struct replaced_fds *replace_fd = malloc(sizeof(struct replaced_fds));
                         if (replace_fd == NULL) {
-                            fprintf(stderr, "force-bind: malloc failed\n");
+                            printf("force-bind: malloc failed\n");
                         } else {
                             bzero(replace_fd, sizeof(struct replaced_fds));
                             replace_fd->next = replaced_fds;
@@ -989,7 +1038,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
     if(matchaddr && *matchaddr && matchaddr[0] != ':'){
         err = getaddrinfo2(matchaddr, &hints, &res);
         if(err) {
-            fprintf(stderr, "Cannot parse match %s: %s\n", matchaddr, strerror(err));
+            printf("Cannot parse match %s: %s\n", matchaddr, strerror(err));
             exit(EXIT_FAILURE);
         }
         cur->addr = copyAddr(res); // FIXME: handle ai_next
@@ -1012,7 +1061,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
         } else {
             err = getaddrinfo2(replace, &hints, &res);
             if(err) {
-                fprintf(stderr, "Cannot parse replacement %s: %s\n", replace, strerror(err));
+                printf("Cannot parse replacement %s: %s\n", replace, strerror(err));
                 exit(EXIT_FAILURE);
             }
             cur->replacement = copyAddr(res); // FIXME: handle ai_next
@@ -1031,7 +1080,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             snprintf(matchaddr4, PATH_MAX, "0.0.0.0%s", matchaddr);
             err = getaddrinfo2(matchaddr4, &hints, &res);
             if(err) {
-                fprintf(stderr, "Cannot parse IPv4 match %s: %s\n", matchaddr, strerror(err));
+                printf("Cannot parse IPv4 match %s: %s\n", matchaddr, strerror(err));
                 exit(EXIT_FAILURE);
             }
             cur->addr = copyAddr(res);
@@ -1057,7 +1106,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             snprintf(matchaddr6, PATH_MAX, "[::]%s", matchaddr);
             err = getaddrinfo2(matchaddr6, &hints, &res);
             if(err) {
-                fprintf(stderr, "Cannot parse IPv6 match %s: %s\n", matchaddr, strerror(err));
+                printf("Cannot parse IPv6 match %s: %s\n", matchaddr, strerror(err));
                 exit(EXIT_FAILURE);
             }
             cur->addr = copyAddr(res);
@@ -1082,7 +1131,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
 
 
         if(cur->addr && cur->replacement && cur->addr->sa_family != cur->replacement->sa_family) {
-            fprintf(stderr, "Not the same address family on both sides: %s\n", map0);
+            printf("Not the same address family on both sides: %s\n", map0);
             exit(EXIT_FAILURE);
         }
 
@@ -1265,7 +1314,7 @@ static void
 usageError(char *msg, char *pname)
 {
     if (msg != NULL)
-        fprintf(stderr, "%s\n", msg);
+        printf("%s\n", msg);
 
     fprintf(stderr,
         "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
@@ -1376,7 +1425,7 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
             printf("Version: %s\n", VERSION);
             exit(EXIT_SUCCESS);
 #else
-            fprintf(stderr, "No version string available\n");
+            printf("No version string available\n");
             exit(EXIT_FAILURE);
 #endif
 
