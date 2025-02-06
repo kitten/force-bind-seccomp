@@ -400,16 +400,33 @@ allocSeccompNotifBuffers(struct seccomp_notif **req, struct seccomp_notif_resp *
 
 }
 
-ssize_t target_memcpy(void *buf, pid_t pid, intptr_t addr, size_t len) {
+ssize_t target_memcpy(void *target, pid_t pid, void *source, size_t len) {
     struct iovec local[1];
     struct iovec remote[1];
 
-    local[0].iov_base = buf;
+    local[0].iov_base = target;
     local[0].iov_len = len;
-    remote[0].iov_base = (void*) addr;
+    remote[0].iov_base = source;
     remote[0].iov_len = len;
 
     return process_vm_readv(pid, local, 1, remote, 1, 0);
+}
+
+ssize_t ptrace_memcpy(void *buf, pid_t pid, intptr_t addr, size_t len) {
+    size_t i;
+    long word;
+    ssize_t bytes_read = 0;
+    unsigned char *ptr = (unsigned char *)buf;
+    for (i = 0; i < len; i += sizeof(long)) {
+        word = ptrace(PTRACE_PEEKDATA, pid, addr + i, NULL);
+        if (word == -1 && errno != 0) {
+            return -1;
+        }
+        size_t chunk_size = (len - i) < sizeof(long) ? (len - i) : sizeof(long);
+        memcpy(ptr + i, &word, chunk_size);
+        bytes_read += chunk_size;
+    }
+    return bytes_read;
 }
 
 /* Handle notifications that arrive via SECCOMP_RET_USER_NOTIF file
@@ -441,7 +458,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
       }
 
       resp->id = req->id;
-      resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE; /* Allow syscall */
+      resp->flags = 0;
       resp->val = 0; /* Success return value is 0 */
       resp->error = 0;
 
@@ -463,6 +480,8 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   // Ignore syscall
                   resp->flags = 0;
                   if(opts->verbose) printf("force-bind: ignore listen(%lld, %lld)\n", req->data.args[0], req->data.args[1]);
+              } else {
+                  resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
               }
               break;
           }
@@ -477,21 +496,19 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               addr = malloc(addrlen);
               if (resp == NULL)
                 errExit("Tracer: malloc");
-              if (target_memcpy(&addr, req->pid, addrptr, addrlen) < 0)
-                errExit("Tracer: target_memcpy");
+              if (target_memcpy(&addr, req->pid, (void*) addrptr, addrlen) < 0) {
+                // abort nicely
+                fprintf(stderr, "Tracer: target_memcpy (arch: %d, ptr: %lld) [%s]\n", req->data.arch, addrptr, strerror(errno));
+                free(addr);
+                resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                break;
+              }
 
               if(!opts->verbose) {
                 char addrstring[PATH_MAX];
                 printf("force-bind: notified of __NR_bind on %s\n",
                   get_ip_str(addr, addrstring, sizeof(addrstring)));
               }
-
-              /* The response to the notification includes the notification ID */
-
-              resp->id = req->id;
-              resp->flags = 0; // Must be zero as at Linux 5.0
-              resp->val = 0; // Success return value is 0
-              resp->error = 0;
 
               if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
 
@@ -516,6 +533,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                 int matchres = matchAllAddr(opts->map, replacement, &newfd, opts);
                 if (matchres < 0) {
                   resp->error = -matchres; // Pass on matching error
+                  resp->flags = 0;
                 } else if (matchres == 0) {
                   /* Continue the syscall. ideally we should filter the IP address and
                    * make sure it is allowed, but this is not yet implemented */
@@ -535,6 +553,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   addfd.flags = SECCOMP_ADDFD_FLAG_SETFD;
                   addfd.newfd_flags = 0;
                   int targetFd = ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
+                  resp->flags = 0;
                   resp->error = (targetFd < 0) ? -errno : 0;
                   resp->val   = targetFd;
 
@@ -606,7 +625,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
           }
 
           default:
-              fprintf(stderr, "seccomp: got unexpected syscall %d", req->data.nr);
+              fprintf(stderr, "seccomp: got unexpected syscall %d\n", req->data.nr);
               exit(EXIT_FAILURE);
         }
 
@@ -629,16 +648,14 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 
    The function return value is the PID of the child process. */
 
-static pid_t
+static void
 tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
 {
-  int notifyFd = recvfd(sockPair[1]);
-  if (notifyFd == -1)
-      errExit("recvfd");
-  /* We no longer need the socket pair */
-  closeSocketPair(sockPair);
-  /* Handle notifications */
-  watchForNotifications(notifyFd, opts);
+    int notifyFd = recvfd(sockPair[1]);
+    if (notifyFd == -1)
+        errExit("recvfd");
+    closeSocketPair(sockPair);
+    watchForNotifications(notifyFd, opts);
 }
 
 static int
@@ -1386,7 +1403,7 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
 int
 main(int argc, char *argv[])
 {
-    pid_t targetPid, tracerPid;
+    pid_t targetPid;
     int sockPair[2];
     struct cmdLineOpts opts;
 
@@ -1421,7 +1438,16 @@ main(int argc, char *argv[])
         ptrace(PTRACE_SETOPTIONS, targetPid, 0, PTRACE_O_TRACESECCOMP);
         exit(process_ptrace(targetPid, &opts));
     } else {
+        ptrace(PTRACE_SEIZE, targetPid, 0, 0);
+
         tracerProcess(sockPair, &opts);
+
+        /* Wait for the target process to terminate */
+        int status;
+        waitpid(targetPid, &status, 0);
+
+        if (!WIFEXITED(status)) exit(EXIT_FAILURE);
+        exit(WEXITSTATUS(status));
     }
 
     exit(EXIT_SUCCESS);
