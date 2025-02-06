@@ -326,7 +326,6 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
          */
         kill(getpid(), SIGSTOP);
     } else {
-        ptrace(PTRACE_TRACEME, 0, 0, 0);
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
             errExit("prctl");
 
@@ -401,21 +400,16 @@ allocSeccompNotifBuffers(struct seccomp_notif **req, struct seccomp_notif_resp *
 
 }
 
-ssize_t ptrace_memcpy(pid_t pid, intptr_t addr, void *buf, size_t len) {
-    size_t i;
-    long word;
-    ssize_t bytes_read = 0;
-    unsigned char *ptr = (unsigned char *)buf;
-    for (i = 0; i < len; i += sizeof(long)) {
-        word = ptrace(PTRACE_PEEKDATA, pid, addr + i, NULL);
-        if (word == -1 && errno != 0) {
-            return -1;
-        }
-        size_t chunk_size = (len - i) < sizeof(long) ? (len - i) : sizeof(long);
-        memcpy(ptr + i, &word, chunk_size);
-        bytes_read += chunk_size;
-    }
-    return bytes_read;
+ssize_t target_memcpy(void *buf, pid_t pid, intptr_t addr, size_t len) {
+    struct iovec local[1];
+    struct iovec remote[1];
+
+    local[0].iov_base = buf;
+    local[0].iov_len = len;
+    remote[0].iov_base = (void*) addr;
+    remote[0].iov_len = len;
+
+    return process_vm_readv(pid, local, 1, remote, 1, 0);
 }
 
 /* Handle notifications that arrive via SECCOMP_RET_USER_NOTIF file
@@ -483,8 +477,8 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               addr = malloc(addrlen);
               if (resp == NULL)
                 errExit("Tracer: malloc");
-              if (ptrace_memcpy(req->pid, addrptr, &addr, addrlen) < 0)
-                errExit("Tracer: ptrace_memcpy");
+              if (target_memcpy(&addr, req->pid, addrptr, addrlen) < 0)
+                errExit("Tracer: target_memcpy");
 
               if(!opts->verbose) {
                 char addrstring[PATH_MAX];
@@ -1427,18 +1421,7 @@ main(int argc, char *argv[])
         ptrace(PTRACE_SETOPTIONS, targetPid, 0, PTRACE_O_TRACESECCOMP);
         exit(process_ptrace(targetPid, &opts));
     } else {
-        /* Wait for the target process to start up and let it continue */
-        int status;
-        waitpid(targetPid, &status, 0);
-        ptrace(PTRACE_CONT, targetPid, NULL, NULL);
-
-        tracerPid = tracerProcess(sockPair, &opts);
-
-        /* After the target process has terminated, kill the tracer process */
-        kill(tracerPid, SIGTERM);
-
-        if (!WIFEXITED(status)) exit(EXIT_FAILURE);
-        exit(WEXITSTATUS(status));
+        tracerProcess(sockPair, &opts);
     }
 
     exit(EXIT_SUCCESS);
