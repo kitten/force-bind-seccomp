@@ -507,28 +507,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               }
               break;
           }
-          case __NR_connect: {
-              int fd = req->data.args[0];
-              if(opts->verbose) {
-                printf("force-bind: notified of __NR_connect on FD %d\n", fd);
-              }
-
-              // Check if the file descriptor was replaced
-              struct replaced_fds *rfd = replaced_fds;
-              while(rfd) {
-                  if(rfd->fd == fd) break;
-                  rfd = rfd->next;
-              }
-
-              if(rfd) {
-                  // Ignore syscall
-                  resp->flags = 0;
-                  if(opts->verbose) printf("force-bind: ignore connect(%lld)\n", fd);
-              } else {
-                  resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-              }
-              break;
-          }
+          case __NR_connect:
           case __NR_bind: {
               /* Check that the process whose info we are accessing is still alive */
               checkNotificationIdIsValid(notifyFd, req->id, "post-open", opts);
@@ -537,7 +516,23 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               intptr_t addrptr = req->data.args[1];
               size_t addrlen = req->data.args[2];
               if(opts->verbose) {
-                printf("force-bind: notified of __NR_bind on fork FD %d\n", socketfd);
+                if (req->data.nr == __NR_connect) {
+                  printf("force-bind: notified of __NR_connect on fork FD %d\n", socketfd);
+                } else if (req->data.nr == __NR_bind) {
+                  printf("force-bind: notified of __NR_bind on fork FD %d\n", socketfd);
+                }
+              }
+
+              // Check if the file descriptor was replaced
+              struct replaced_fds *rfd = replaced_fds;
+              while(rfd) {
+                  if(rfd->fd == socketfd) break;
+                  rfd = rfd->next;
+              }
+              if (rfd) {
+                printf("force-bind: already connected on FD %d\n", socketfd);
+                resp->flags = 0;
+                break;
               }
 
               addr = malloc(addrlen);
@@ -610,7 +605,9 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                   }
                   resp->flags = 0;
                   resp->error = (targetFd < 0) ? -errno : 0;
-                  resp->val   = targetFd;
+                  if (req->data.nr == __NR_bind) {
+                    resp->val   = targetFd;
+                  }
 
                   if(!opts->quiet) {
                     char addrstring[PATH_MAX];
